@@ -1,0 +1,4 @@
+chromadb==1.5.9
+ollama==0.6.2
+pandas==3.0.3
+tqdm==4.67.3
