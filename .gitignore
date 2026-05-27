@@ -1,0 +1,6 @@
+venv/
+chroma_db/
+document.txt
+my_answers.csv
+RAG_answers.csv
+RAG_questions_table.csv
