@@ -1,8 +1,8 @@
-![Language EN](https://github.com/WilayzJerti/RAG_Agent/blob/main/README_en.md)
 ## Описание проекта
 
 RAG Agent использует локальную языковую модель (LLM) `gemma4` через Ollama для генерации ответов на вопросы. Проект позволяет массово обрабатывать таблицы с вопросами и сравнивать полученные ответы с эталонными.
 
+![Language EN](https://github.com/WilayzJerti/RAG_Agent/blob/main/README_en.md)
 ## Установка и настройка
 
 ### 1. Создание виртуального окружения Python
