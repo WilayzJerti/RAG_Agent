@@ -2,6 +2,7 @@
 
 RAG Agent uses a local language model (LLM) `gemma4` through Ollama to generate answers to questions. The project allows you to process questions and get responses based on custom documentation using Retrieval-Augmented Generation (RAG) technology.
 
+![Русский язык](https://github.com/WilayzJerti/RAG_Agent/blob/main/README.md)
 ## Installation and Setup
 
 ### 1. Creating a Python Virtual Environment
