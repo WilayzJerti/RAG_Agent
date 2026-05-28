@@ -1,107 +1,162 @@
 import os
 import re
 import pandas as pd
-from typing import List
+from typing import List, Tuple
 import hashlib
 from tqdm import tqdm
 import chromadb
 from chromadb.utils import embedding_functions
 import ollama
 
-# .env
+#.env 
 DOCUMENT_TXT_PATH = "document.txt"
 QUESTIONS_CSV = "RAG_questions_table.csv"
 ANSWERS_CSV = "RAG_answers.csv"
 OUTPUT_CSV = "my_answers.csv"
 
 OLLAMA_MODEL = "gemma4"
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 100
-TOP_K = 3
+CHUNK_SIZE = 250
+CHUNK_OVERLAP = 80
+TOP_K = 10
+EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
+
+#Нормализация текста 
+def normalize_text(text: str) -> str:
+    replacements = {
+        'один': '1', 'два': '2', 'три': '3', 'четыре': '4', 'пять': '5',
+        'шесть': '6', 'семь': '7', 'восемь': '8', 'девять': '9', 'десять': '10',
+        'сто': '100', 'тысяча': '1000', 'миллион': '1000000',
+        'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5',
+        'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10',
+        'hundred': '100', 'thousand': '1000', 'million': '1000000'
+    }
+    for word, num in replacements.items():
+        text = re.sub(rf'\b{word}\b', num, text, flags=re.IGNORECASE)
+    return text
 
 #Загрузка документа
 def load_document() -> str:
-    """Загружает документ из локального файла"""
     if not os.path.exists(DOCUMENT_TXT_PATH):
-        raise FileNotFoundError(f"Файл документа {DOCUMENT_TXT_PATH} не найден. Положите его в папку со скриптом")
+        raise FileNotFoundError(f"Файл {DOCUMENT_TXT_PATH} не найден")
     with open(DOCUMENT_TXT_PATH, 'r', encoding='utf-8') as f:
-        return f.read()
+        text = f.read()
+    text = re.sub(r'\s+', ' ', text)
+    text = normalize_text(text)
+    return text
 
 #Разбивка на чанки
 def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
-    """Разбивает текст на перекрывающиеся чанки по словам"""
-    words = text.split()
     chunks = []
-    step = chunk_size - overlap
-    for i in range(0, len(words), step):
-        chunk_words = words[i:i+chunk_size]
-        if not chunk_words:
-            continue
-        if len(chunk_words) < 50 and chunks:
-            chunks[-1] += " " + " ".join(chunk_words)
-        else:
-            chunks.append(" ".join(chunk_words))
+    start = 0
+    text_len = len(text)
+    while start < text_len:
+        end = start + chunk_size
+        chunk = text[start:end]
+        chunks.append(chunk.strip())
+        start += chunk_size - overlap
+    if len(chunks) > 1 and len(chunks[-1]) < 50:
+        chunks[-2] += " " + chunks[-1]
+        chunks.pop()
     return chunks
 
-#Векторное хранилище
+#Создаем векторное хранилище
 def build_vectorstore(chunks: List[str], persist_dir: str = "./chroma_db"):
-    """Создаёт векторное хранилище с эмбеддингами"""
     client = chromadb.PersistentClient(path=persist_dir)
     try:
         client.delete_collection("doc_chunks")
     except:
         pass
     embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
+        model_name=EMBEDDING_MODEL
     )
     collection = client.create_collection(
         name="doc_chunks",
         embedding_function=embedding_fn
     )
     ids = [hashlib.md5(chunk.encode()).hexdigest()[:12] for chunk in chunks]
-    collection.add(documents=chunks, ids=ids)
+    batch_size = 100
+    for i in range(0, len(chunks), batch_size):
+        batch_chunks = chunks[i:i+batch_size]
+        batch_ids = ids[i:i+batch_size]
+        collection.add(documents=batch_chunks, ids=batch_ids)
     print(f"Векторное хранилище создано, {len(chunks)} чанков")
     return collection
 
 #Поиск релевантных чанков
-def retrieve_context(collection, query: str, top_k: int) -> str:
-    """Возвращает топ-k релевантных чанков в виде одного текста"""
+def retrieve_context(collection, query: str, top_k: int) -> List[str]:
     results = collection.query(query_texts=[query], n_results=top_k)
     if results['documents']:
-        return "\n---\n".join(results['documents'][0])
-    return ""
+        return results['documents'][0]
+    return []
 
-#Чат с Ollama, и извлекаем только числа
-def ask_llm(prompt: str) -> str:
-    """Отправляет запрос в Ollama и возвращает ответ"""
-    response = ollama.chat(model=OLLAMA_MODEL, messages=[{"role": "user", "content": prompt}])
-    answer = response['message']['content'].strip()
-    numbers = re.findall(r'-?\d+\.?\d*', answer)
-    if numbers:
-        return numbers[0]
-    return "0"
-
-#RAG-цикл
-def rag_answer(question: str, collection) -> str:
-    """Основной RAG-цикл: поиск контекста + генерация ответа"""
-    context = retrieve_context(collection, question, TOP_K)
-    if not context.strip():
+#RAG-функция
+def ask_llm_with_context(question: str, contexts: List[str]) -> str:
+    if not contexts:
         return "0"
-    prompt = f"""Ты — помощник, который отвечает на вопросы, используя ТОЛЬКО контекст.
-Твоя задача — дать краткий числовой ответ. Никаких пояснений, только число.
-Если в контексте нет точного ответа или он неясен, ответь "0".
-Никогда не пиши лишних слов.
+    
+    context_block = "\n---\n".join([f"[{i+1}] {c}" for i, c in enumerate(contexts)])
+    
+    system = """Ты — аналитик, извлекающий числовые ответы из контекста.
+Правила:
+- Найди в контексте число, которое отвечает на вопрос.
+- Если точное число найдено, выведи ТОЛЬКО это число.
+- Если чисел несколько, выбери то, которое соответствует вопросу.
+- Если числа нет, выведи 0.
+- Никаких пояснений, только число или 0.
 
-Контекст:
-{context}
+Примеры:
+Контекст: [1] В 2022 году рынок ИИ составил 136.6 млрд.
+Вопрос: Какой объём рынка ИИ в 2022 году?
+Ответ: 136.6
+
+Контекст: [1] Средняя продолжительность жизни лабуба 100 лет.
+Вопрос: Сколько лет живут лабуба?
+Ответ: 100
+
+Контекст: [1] Дроны летают 30 минут. [2] Скорость дрона 50 км/ч.
+Вопрос: Максимальная скорость дрона?
+Ответ: 50
+"""
+    user_prompt = f"""Контекст:
+{context_block}
 
 Вопрос: {question}
 Числовой ответ:"""
-    return ask_llm(prompt)
+    
+    response = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_prompt}
+        ],
+        options={"temperature": 0.0}
+    )
+    answer = response['message']['content'].strip()
+    
+    match = re.search(r'-?\d+(?:\.\d+)?', answer)
+    if match:
+        return match.group(0)
+    
+    word_to_num = {
+        'ноль':0, 'один':1, 'два':2, 'три':3, 'четыре':4, 'пять':5,
+        'шесть':6, 'семь':7, 'восемь':8, 'девять':9, 'десять':10,
+        'сто':100, 'тысяча':1000, 'миллион':1000000, 'миллиард':1000000000,
+        'zero':0, 'one':1, 'two':2, 'three':3, 'four':4, 'five':5,
+        'six':6, 'seven':7, 'eight':8, 'nine':9, 'ten':10
+    }
+    for word, num in word_to_num.items():
+        if word in answer.lower():
+            return str(num)
+    return "0"
+
+def rag_answer(question: str, collection) -> str:
+    contexts = retrieve_context(collection, question, TOP_K)
+    if not contexts:
+        return "0"
+    return ask_llm_with_context(question, contexts)
 
 #Обработка всех вопросов
 def process_questions(collection, questions_df: pd.DataFrame) -> pd.DataFrame:
-    """Генерирует ответы для всех вопросов из таблицы"""
     answers = []
     for q in tqdm(questions_df['Question'], desc="Ответы на вопросы"):
         ans = rag_answer(q, collection)
@@ -109,24 +164,29 @@ def process_questions(collection, questions_df: pd.DataFrame) -> pd.DataFrame:
     questions_df['Answer'] = answers
     return questions_df
 
-#Оценка качества
-def evaluate(our_df: pd.DataFrame, ground_truth_df: pd.DataFrame) -> float:
-    """Сравнивает ответы по row_id с эталоном"""
-    our_df['row_id'] = our_df['row_id'].astype(str)
-    ground_truth_df['row_id'] = ground_truth_df['row_id'].astype(str)
-    
-    merged = pd.merge(our_df, ground_truth_df, on='row_id', suffixes=('_our', '_true'))
-    merged['Answer_our_num'] = pd.to_numeric(merged['Answer_our'], errors='coerce')
-    merged['Answer_true_num'] = pd.to_numeric(merged['Answer_true'], errors='coerce')
-    correct = (merged['Answer_our_num'] == merged['Answer_true_num']).sum()
+#Оценка качества (а то с ума можно сойти, вручную все проверять:D)
+def evaluate(pred_path: str, true_path: str) -> float:
+    pred_df = pd.read_csv(pred_path)
+    true_df = pd.read_csv(true_path)
+    pred_df['row_id'] = pred_df['row_id'].astype(str)
+    true_df['row_id'] = true_df['row_id'].astype(str)
+    merged = pd.merge(pred_df, true_df, on='row_id', suffixes=('_pred', '_true'))
+    merged['pred_num'] = pd.to_numeric(merged['Answer_pred'], errors='coerce')
+    merged['true_num'] = pd.to_numeric(merged['Answer_true'], errors='coerce')
+    correct = (merged['pred_num'] == merged['true_num']).sum()
     total = len(merged)
-    accuracy = correct / total * 100
-    print(f"\nСовпадение с правильными ответами: {correct}/{total} = {accuracy:.2f}%")
-    return accuracy
+    acc = correct / total * 100
+    print(f"\nСовпадение: {correct}/{total} = {acc:.2f}%")
+    errors = merged[merged['pred_num'] != merged['true_num']]
+    if not errors.empty:
+        print("\nОшибки (row_id | ответ LLM | правильный):")
+        for _, row in errors.iterrows():
+            print(f"   {row['row_id']} | {row['Answer_pred']} | {row['Answer_true']}")
+    return acc
 
-# main есть main че еще сказать
+#main есть main че еще сказать
 def main():
-    print("1. Загрузка документа из document.txt...")
+    print("1. Загрузка и нормализация документа...")
     text = load_document()
     print(f"   Длина текста: {len(text)} символов")
     
@@ -134,29 +194,26 @@ def main():
     chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
     print(f"   Получено {len(chunks)} чанков")
     
-    print("3. Построение векторного индекса...")
+    print("3. Построение векторного индекса (ChromaDB)...")
     collection = build_vectorstore(chunks)
     
-    print("4. Загрузка вопросов из CSV...")
-    if not os.path.exists(QUESTIONS_CSV):
-        raise FileNotFoundError(f"Не найден файл {QUESTIONS_CSV}")
+    print("4. Загрузка вопросов...")
     questions_df = pd.read_csv(QUESTIONS_CSV)
-    if 'row_id' not in questions_df.columns or 'Question' not in questions_df.columns:
-        raise ValueError("В CSV вопросов должны быть колонки 'row_id' и 'Question'")
     
     print("5. Генерация ответов через RAG...")
     result_df = process_questions(collection, questions_df)
     result_df.to_csv(OUTPUT_CSV, index=False)
-    print(f"Ответы сохранены в {OUTPUT_CSV}")
+    print(f"   Ответы сохранены в {OUTPUT_CSV}")
     
-    print("6. Сравнение с эталонными ответами...")
-    if not os.path.exists(ANSWERS_CSV):
-        print(f"Файл {ANSWERS_CSV} не найден, оценка невозможна.")
-        return
-    true_df = pd.read_csv(ANSWERS_CSV)
-    evaluate(result_df, true_df)
-    
-    print("\nГотово! Проанализируйте несовпадения в my_answers.csv")
+    print("6. Оценка качества...")
+    if os.path.exists(ANSWERS_CSV):
+        acc = evaluate(OUTPUT_CSV, ANSWERS_CSV)
+        if acc >= 96.4:
+            print("Цель достигнута")
+        else:
+            print(f"Точность {acc:.2f}% ниже 96.4%")
+    else:
+        print(f"Файл {ANSWERS_CSV} не найден")
 
 if __name__ == "__main__":
     main()
